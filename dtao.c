@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/select.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <wayland-client.h>
@@ -34,17 +35,23 @@
 
 /* Includes the newline character */
 #define MAX_LINE_LEN 8192
+#define MAX_CMD_LEN 256
+#define MAX_CLICKABLES 256
 
 enum align { ALIGN_C, ALIGN_L, ALIGN_R };
 
 static struct wl_display *display;
 static struct wl_compositor *compositor;
+static struct wl_subcompositor *subcompositor;
 static struct wl_shm *shm;
 static struct zwlr_layer_shell_v1 *layer_shell;
 
 static struct zwlr_layer_surface_v1 *layer_surface;
 static struct wl_output *wl_output;
 static struct wl_surface *wl_surface;
+
+static struct wl_seat *wl_seat;
+static struct wl_pointer *wl_pointer;
 
 static int32_t output = -1;
 
@@ -135,8 +142,42 @@ parse_color(const char *str, pixman_color_t *clr)
 	return 0;
 }
 
+struct clickable {
+	uint32_t x1, y1, x2, y2, btn;
+	char cmd[MAX_CMD_LEN];
+};
+
+static int
+parse_clickable_area(char *str, struct clickable *c, uint32_t xpos, uint32_t ypos)
+{
+	c->x1 = xpos;
+	c->y1 = 0;
+
+	int i = 0;
+
+	char *b = str;
+	char btn[4]; /* arbitrary number length limit */
+
+	while (*b != ',') {
+		/* no comma found */
+		if (*b == '\0') {
+			return 1;
+		}
+		btn[i] = *b;
+		i++;
+		b++;
+	}
+	c->btn = atoi(btn);
+
+	strlcpy(c->cmd, str + i + 1, MAX_CMD_LEN);
+	return 0;
+}
+
+static struct clickable clickies[MAX_CLICKABLES];
+static int clicky_i = 0;
+
 static char *
-handle_cmd(char *cmd, pixman_color_t *bg, pixman_color_t *fg)
+handle_cmd(char *cmd, pixman_color_t *bg, pixman_color_t *fg, uint32_t *xpos, uint32_t *ypos)
 {
 	char *arg, *end;
 
@@ -157,6 +198,14 @@ handle_cmd(char *cmd, pixman_color_t *bg, pixman_color_t *fg)
 			*fg = fgcolor;
 		} else if (parse_color(arg, fg)) {
 			fprintf(stderr, "Bad color string \"%s\"\n", arg);
+		}
+	} else if (!strcmp(cmd, "ca")) {
+		if (!*arg) {
+			clickies[clicky_i].x2 = *xpos;
+			clickies[clicky_i].y2 = height;
+			clicky_i++;
+		} else if (parse_clickable_area(arg, &clickies[clicky_i], *xpos, *ypos)) {
+				fprintf(stderr, "bad clicky \"%s\"\n", arg);
 		}
 	} else {
 		fprintf(stderr, "Unrecognized command \"%s\"\n", cmd);
@@ -220,7 +269,7 @@ draw_frame(char *text)
 		if (state == UTF8_ACCEPT && *p == '^') {
 			p++;
 			if (*p != '^') {
-				p = handle_cmd(p, &textbgcolor, &textfgcolor);
+				p = handle_cmd(p, &textbgcolor, &textfgcolor, &xpos, &ypos);
 				pixman_image_unref(fgfill);
 				fgfill = pixman_image_create_solid_fill(&textfgcolor);
 				continue;
@@ -296,6 +345,16 @@ draw_frame(char *text)
 			xdraw = (width - maxxpos) / 2;
 			break;
 	}
+
+	clickies[clicky_i] = (struct clickable) { 0 };
+
+	int i = clicky_i;
+	while (i > 0) {
+		i--;
+		clickies[i].x1 += xdraw;
+		clickies[i].x2 += xdraw;
+	}
+
 	pixman_image_composite32(PIXMAN_OP_OVER, background, NULL, bar, 0, 0, 0, 0,
 			xdraw, 0, width, height);
 	pixman_image_composite32(PIXMAN_OP_OVER, foreground, NULL, bar, 0, 0, 0, 0,
@@ -345,13 +404,145 @@ static struct zwlr_layer_surface_v1_listener layer_surface_listener = {
 	.closed = layer_surface_closed,
 };
 
+struct input_state {
+	struct wl_surface *surface;
+	double x, y;
+	uint32_t button;
+};
+
+static void
+noop() {}
+
+static void
+wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
+			uint32_t serial, struct wl_surface *surface,
+			wl_fixed_t surface_x, wl_fixed_t surface_y)
+{
+	struct input_state *istate = data;
+	istate->surface = surface;
+	istate->x = wl_fixed_to_double(surface_x);
+	istate->y = wl_fixed_to_double(surface_y);
+}
+
+static void
+wl_pointer_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time,
+		wl_fixed_t surface_x, wl_fixed_t surface_y)
+{
+	struct input_state *istate = data;
+	istate->x = wl_fixed_to_double(surface_x);
+	istate->y = wl_fixed_to_double(surface_y);
+}
+
+static void
+wl_pointer_button(void *data, struct wl_pointer *wl_pointer, uint32_t serial,
+		uint32_t time, uint32_t button, uint32_t state)
+{
+	struct input_state *istate = data;
+	istate->button = state == WL_POINTER_BUTTON_STATE_RELEASED ? 0 : button;
+}
+
+static void
+wl_pointer_leave(void *data, struct wl_pointer *wl_pointer,
+		uint32_t serial, struct wl_surface *surface)
+{
+	struct input_state *istate = data;
+	istate->surface = NULL;
+}
+
+/* taken from dzen's util.c */
+void
+spawn(const char *arg) {
+	static const char *shell = NULL;
+
+	if(!shell && !(shell = getenv("SHELL")))
+		shell = "/bin/sh";
+	if(!arg)
+		return;
+	/* The double-fork construct avoids zombie processes and keeps the code
+	* clean from stupid signal handlers. */
+	if(fork() == 0) {
+		if(fork() == 0) {
+			setsid();
+			execl(shell, shell, "-c", arg, (char *)NULL);
+			fprintf(stderr, "dtao: execl '%s -c %s'", shell, arg);
+			perror(" failed");
+		}
+		exit(0);
+	}
+	wait(0);
+}
+
+static void
+wl_pointer_frame(void *data, struct wl_pointer *wl_pointer)
+{
+	struct input_state *istate = data;
+	if (istate->button == 0)
+		return;
+
+	int i = clicky_i;
+	while (i > 0) {
+		i--;
+		struct clickable *c = &clickies[i];
+		if (c->btn == istate->button - 271 &&
+				istate->x >= c->x1 && istate->x <= c->x2 &&
+				istate->y >= c->y1 && istate->y <= c->y2) {
+			spawn(c->cmd);
+			break;
+		}
+	}
+	istate->button = 0;
+}
+
+static const struct wl_pointer_listener wl_pointer_listener = {
+	.enter = wl_pointer_enter,
+	.leave = wl_pointer_leave,
+	.motion = wl_pointer_motion,
+	.button = wl_pointer_button,
+	.axis = noop,
+	.axis_source = noop,
+	.axis_stop = noop,
+	.axis_discrete = noop,
+	.frame = wl_pointer_frame,
+};
+
+static void
+wl_seat_capabilities(void *data, struct wl_seat *wl_seat, uint32_t capabilities)
+{
+	struct input_state *istate = data;
+	bool have_pointer = capabilities & WL_SEAT_CAPABILITY_POINTER;
+
+	if (have_pointer && wl_pointer == NULL) {
+		wl_pointer = wl_seat_get_pointer(wl_seat);
+		wl_pointer_add_listener(wl_pointer,
+				&wl_pointer_listener, istate);
+	} else if (!have_pointer && wl_pointer != NULL) {
+		wl_pointer_release(wl_pointer);
+		wl_pointer = NULL;
+	}
+}
+
+static void
+wl_seat_name(void *data, struct wl_seat *wl_seat, const char *name)
+{
+	fprintf(stderr, "seat name: %s\n", name);
+}
+
+static const struct wl_seat_listener wl_seat_listener = {
+	.capabilities = wl_seat_capabilities,
+	.name = wl_seat_name,
+};
+
 static void
 handle_global(void *data, struct wl_registry *registry,
 		uint32_t name, const char *interface, uint32_t version)
 {
+	struct input_state *istate = data;
 	if (strcmp(interface, wl_compositor_interface.name) == 0) {
 		compositor = wl_registry_bind(registry, name,
 				&wl_compositor_interface, 4);
+	} else if (strcmp(interface, wl_subcompositor_interface.name) == 0) {
+		subcompositor = wl_registry_bind(
+				registry, name, &wl_subcompositor_interface, 1);
 	} else if (strcmp(interface, wl_shm_interface.name) == 0) {
 		shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
 	} else if (strcmp(interface, wl_output_interface.name) == 0) {
@@ -362,10 +553,17 @@ handle_global(void *data, struct wl_registry *registry,
 	} else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
 		layer_shell = wl_registry_bind(registry, name,
 				&zwlr_layer_shell_v1_interface, 1);
+	} else if (strcmp(interface, wl_seat_interface.name) == 0) {
+		wl_seat = wl_registry_bind(registry, name, &wl_seat_interface, 5);
+		wl_seat_add_listener(wl_seat, &wl_seat_listener, istate);
 	}
+
 }
 
-static const struct wl_registry_listener registry_listener = {.global = handle_global,};
+static const struct wl_registry_listener registry_listener = {
+	.global = handle_global,
+	.global_remove = noop,
+};
 
 static void
 read_stdin(void)
@@ -563,7 +761,10 @@ main(int argc, char **argv)
 		BARF("Failed to create display");
 
 	struct wl_registry *registry = wl_display_get_registry(display);
-	wl_registry_add_listener(registry, &registry_listener, NULL);
+
+	struct input_state *istate = malloc(sizeof(struct input_state));
+
+	wl_registry_add_listener(registry, &registry_listener, istate);
 	wl_display_roundtrip(display);
 
 	if (!compositor || !shm || !layer_shell)
