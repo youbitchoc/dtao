@@ -37,6 +37,8 @@
 #define MAX_LINE_LEN 8192
 #define MAX_CMD_LEN 256
 #define MAX_CLICKABLES 256
+#define MAX_MENUITEMS 256
+#define MAX_MENUS 256
 
 enum align { ALIGN_C, ALIGN_L, ALIGN_R };
 
@@ -147,29 +149,90 @@ struct clickable {
 	char cmd[MAX_CMD_LEN];
 };
 
+/* good luck */
 static int
-parse_clickable_area(char *str, struct clickable *c, uint32_t xpos, uint32_t ypos)
+copy_till_char(char *buf, char *str, char c)
 {
-	c->x1 = xpos;
-	c->y1 = 0;
+	int i = 0, len = strlen(buf);
+	while (str[i] != c && (i < len - 1) && (buf[i++] = str[i]));
+	buf[i] = '\0';
+	return i;
+}
 
-	int i = 0;
+static int
+parse_clickable_area(char *str, struct clickable *clicky, uint32_t xpos, uint32_t ypos)
+{
+	clicky->x1 = xpos;
+	clicky->y1 = 0;
 
-	char *b = str;
 	char btn[4]; /* arbitrary number length limit */
 
-	while (*b != ',') {
-		/* no comma found */
-		if (*b == '\0') {
-			return 1;
-		}
-		btn[i] = *b;
-		i++;
-		b++;
-	}
-	c->btn = atoi(btn);
+	strlcpy(clicky->cmd, str + 1 + copy_till_char(btn, str, ','), MAX_CMD_LEN);
+	clicky->btn = atoi(btn);
 
-	strlcpy(c->cmd, str + i + 1, MAX_CMD_LEN);
+	return 0;
+}
+
+/* screwing around */
+/* this is probably too scuffed to have been in dzen */
+
+/* ^menu(ID,btn,height..?)title^menu(exec1)opt1^menu(exec2)opt2...^menu() */
+
+struct menu {
+	char id[4]; /* convert utf8 string to int */
+	bool show = false;
+	uint32_t btn;
+	struct clickable entries[MAX_MENUITEMS];
+	struct wl_buffer *wl_buffer;
+};
+
+struct menu menus[MAX_MENUS];
+
+static int menu_i, item_i, menu_x, menu_y, menu_width, post_x, post_y;
+
+static int
+parse_menu(char *str, uint32_t *xpos, uint32_t *ypos)
+{
+	if (!menu_i) {
+		char id[8];
+		str += 1 + copy_till_char(id, str, ',');
+
+		/* find our id in menulist */
+		int new = -1;
+		for (menu_i = 0; menu_i < MAX_MENUS; menu_i++) {
+			if (!new && !menus[menu_i].id) {
+				new = menu_i;
+			} else if (!strcmp(id, menus[menu_i].id)) {
+				new = -1;
+				break;
+			}
+		}
+
+		if (new == -1 && menu_i == MAX_MENUS) {
+			/* no space left to make new */
+			return -1;
+		} else {
+			menu_i = new;
+
+			strlcpy(menus[menu_i].id, id, 8);
+
+			char btn[4];
+			str += copy_till_char(btn, str, ',');
+			menus[menu_i].btn = atoi(btn);
+		}
+
+		menu_x = *xpos, menu_y = *ypos;
+		item_i = 0;
+	} else {
+		if (item_i == 0) {
+			post_x = *xpos, post_y = *ypos;
+			*xpos = menu_x, *ypos = menu_y;
+		}
+		parse_clickable_area(str, menus[menu_i].entries, *xpos, *ypos);
+		item_i++;
+	}
+	*ypos += height;
+
 	return 0;
 }
 
@@ -180,6 +243,8 @@ static char *
 handle_cmd(char *cmd, pixman_color_t *bg, pixman_color_t *fg, uint32_t *xpos, uint32_t *ypos)
 {
 	char *arg, *end;
+
+	int skip;
 
 	if (!(arg = strchr(cmd, '(')) || !(end = strchr(arg + 1, ')')))
 		return cmd;
@@ -205,7 +270,19 @@ handle_cmd(char *cmd, pixman_color_t *bg, pixman_color_t *fg, uint32_t *xpos, ui
 			clickies[clicky_i].y2 = height;
 			clicky_i++;
 		} else if (parse_clickable_area(arg, &clickies[clicky_i], *xpos, *ypos)) {
-				fprintf(stderr, "bad clicky \"%s\"\n", arg);
+			fprintf(stderr, "bad clicky \"%s\"\n", arg);
+		}
+	} else if (!strcmp(cmd, "menu")) {
+		if (!*arg) {
+			*ypos = menu_y;
+			*xpos = menu_x;
+			menu_width = 0;
+			menu_i = 0;
+		} else {
+			skip = parse_menu(arg, xpos, ypos);
+			if (skip < 0)
+				fprintf(stderr, "bad menu \"%s\"\n", arg);
+			*end = ')';
 		}
 	} else {
 		fprintf(stderr, "Unrecognized command \"%s\"\n", cmd);
@@ -214,6 +291,9 @@ handle_cmd(char *cmd, pixman_color_t *bg, pixman_color_t *fg, uint32_t *xpos, ui
 	/* Restore string for later redraws */
 	*--arg = '(';
 	*end = ')';
+
+	end += skip;
+
 	return end;
 }
 
@@ -478,6 +558,9 @@ wl_pointer_frame(void *data, struct wl_pointer *wl_pointer)
 	struct input_state *istate = data;
 	if (istate->button == 0)
 		return;
+
+	if (istate->surface != wl_surface)
+		wl_surface_destroy(istate->surface);
 
 	int i = clicky_i;
 	while (i > 0) {
