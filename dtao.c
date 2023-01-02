@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/select.h>
+#include <signal.h>
 #include <time.h>
 #include <unistd.h>
 #include <wayland-client.h>
@@ -34,6 +35,7 @@
 
 /* Includes the newline character */
 #define MAX_LINE_LEN 8192
+#define MAX_CLICKABLES 64
 
 enum align { ALIGN_C, ALIGN_L, ALIGN_R };
 
@@ -45,6 +47,9 @@ static struct zwlr_layer_shell_v1 *layer_shell;
 static struct zwlr_layer_surface_v1 *layer_surface;
 static struct wl_output *wl_output;
 static struct wl_surface *wl_surface;
+
+static struct wl_seat *wl_seat;
+static struct wl_pointer *wl_pointer;
 
 static int32_t output = -1;
 
@@ -79,6 +84,15 @@ static pixman_color_t
 		.blue = 0xb3b3,
 		.alpha = 0xffff,
 	};
+
+struct clickable {
+	uint32_t x1, y1, x2, y2;
+	uint8_t btn;
+	char *cmd;
+};
+
+static int clickies = 0;
+static struct clickable clickables[MAX_CLICKABLES];
 
 static void
 wl_buffer_release(void *data, struct wl_buffer *wl_buffer)
@@ -201,7 +215,29 @@ parse_movement (char *str, uint32_t *xpos, uint32_t *ypos, uint32_t xoffset, uin
 		*ypos = height;
 
 	return 0;
+}
 
+static int
+parse_clickable(char *str, struct clickable *c, uint32_t xpos, uint32_t ypos)
+{
+	c->x1 = xpos;
+	c->y1 = 0;
+	c->btn = 0;
+
+	for (; *str && *str != ','; str++)
+		if (isdigit(*str))
+			c->btn = c->btn*10 + (*str - '0');
+
+	if (!*str)
+		return 1;
+
+	free(c->cmd);
+	c->cmd = strdup(str + 1);
+
+	if (!c->cmd)
+		EBARF("malloc: ");
+
+	return 0;
 }
 
 static char *
@@ -237,6 +273,14 @@ handle_cmd(char *cmd, pixman_color_t *bg, pixman_color_t *fg, uint32_t *xpos, ui
 		savedx = *xpos;
 	} else if (!strcmp(cmd, "rx")) {
 		*xpos = savedx;
+	} else if (!strcmp(cmd, "ca")) {
+		if (!*arg) {
+			clickables[clickies].x2 = *xpos;
+			clickables[clickies].y2 = height;
+			clickies++;
+		} else if (parse_clickable(arg, &clickables[clickies], *xpos, *ypos)) {
+			fprintf(stderr, "Bad click area \"%s\"\n", arg);
+		}
 	} else {
 		fprintf(stderr, "Unrecognized command \"%s\"\n", cmd);
 	}
@@ -288,6 +332,8 @@ draw_frame(char *text)
 			width, height, NULL, width * 4);
 
 	pixman_image_t *fgfill = pixman_image_create_solid_fill(&textfgcolor);
+
+	clickies = 0;
 
 	/* Start drawing at center-left (ypos sets the text baseline) */
 	uint32_t xpos = 0, maxxpos = 0;
@@ -375,6 +421,21 @@ draw_frame(char *text)
 			xdraw = (width - maxxpos) / 2;
 			break;
 	}
+
+	if (xdraw) {
+		for (int i = 0; i < clickies; i++) {
+			clickables[i].x1 += xdraw;
+			clickables[i].x2 += xdraw;
+		}
+	}
+
+	if (expand) {
+		struct wl_region *inputregion = wl_compositor_create_region(compositor);
+		wl_region_add(inputregion, xdraw, 0, MAX(maxxpos, 1), height);
+		wl_surface_set_input_region(wl_surface, inputregion);
+		wl_region_destroy(inputregion);
+	}
+
 	pixman_image_composite32(PIXMAN_OP_OVER, background, NULL, bar, 0, 0, 0, 0,
 			xdraw, 0, width, height);
 	pixman_image_composite32(PIXMAN_OP_OVER, foreground, NULL, bar, 0, 0, 0, 0,
@@ -424,10 +485,156 @@ static struct zwlr_layer_surface_v1_listener layer_surface_listener = {
 	.closed = layer_surface_closed,
 };
 
+struct input_state {
+	struct wl_surface *surface;
+	double x, y;
+	uint32_t button;
+};
+
+static void
+wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
+			uint32_t serial, struct wl_surface *surface,
+			wl_fixed_t surface_x, wl_fixed_t surface_y)
+{
+	struct input_state *istate = data;
+	istate->surface = surface;
+	istate->x = wl_fixed_to_double(surface_x);
+	istate->y = wl_fixed_to_double(surface_y);
+}
+
+static void
+wl_pointer_motion(void *data, struct wl_pointer *wl_pointer, uint32_t time,
+		wl_fixed_t surface_x, wl_fixed_t surface_y)
+{
+	struct input_state *istate = data;
+	istate->x = wl_fixed_to_double(surface_x);
+	istate->y = wl_fixed_to_double(surface_y);
+}
+
+static void
+wl_pointer_button(void *data, struct wl_pointer *wl_pointer, uint32_t serial,
+		uint32_t time, uint32_t button, uint32_t state)
+{
+	struct input_state *istate = data;
+	istate->button = state == WL_POINTER_BUTTON_STATE_RELEASED ? 0 : button;
+}
+
+static void
+wl_pointer_leave(void *data, struct wl_pointer *wl_pointer,
+		uint32_t serial, struct wl_surface *surface)
+{
+	struct input_state *istate = data;
+	istate->surface = NULL;
+}
+
+static void
+wl_pointer_axis(void *data, struct wl_pointer *wl_pointer, uint32_t time,
+		uint32_t axis, wl_fixed_t value)
+{}
+
+static void
+wl_pointer_axis_source(void *data, struct wl_pointer *wl_pointer,
+		uint32_t axis_source)
+{}
+
+static void
+wl_pointer_axis_stop(void *data, struct wl_pointer *wl_pointer,
+		uint32_t time, uint32_t axis)
+{}
+
+static void
+wl_pointer_axis_discrete(void *data, struct wl_pointer *wl_pointer,
+			uint32_t axis, int32_t discrete)
+{}
+
+void
+spawn(const char *arg)
+{
+	static const char *shell = NULL;
+
+	if (!arg)
+		return;
+
+	if (!shell && !(shell = getenv("SHELL")))
+		shell = "/bin/sh";
+
+	if (fork() == 0) {
+		dup2(STDERR_FILENO, STDOUT_FILENO);
+		setsid();
+		execl(shell, shell, "-c", arg, (char *)NULL);
+		EBARF("dtao: execl '%s -c %s' failed: ", shell, arg);
+	}
+
+	if (signal(SIGCHLD, SIG_IGN) == SIG_ERR)
+		EBARF("failed to ignore SIGCHLD");
+}
+
+static void
+wl_pointer_frame(void *data, struct wl_pointer *wl_pointer)
+{
+	struct input_state *istate = data;
+
+	if (!istate || istate->button == 0)
+		return;
+
+	for (int i = 0; i < clickies; i++) {
+		if (clickables[i].btn == istate->button - 271 &&
+				istate->x >= clickables[i].x1 &&
+				istate->x <= clickables[i].x2 &&
+				istate->y >= clickables[i].y1 &&
+				istate->y <= clickables[i].y2) {
+			spawn(clickables[i].cmd);
+			break;
+		}
+	}
+
+	istate->button = 0;
+}
+
+static const struct wl_pointer_listener wl_pointer_listener = {
+	.enter = wl_pointer_enter,
+	.leave = wl_pointer_leave,
+	.motion = wl_pointer_motion,
+	.button = wl_pointer_button,
+	.axis = wl_pointer_axis,
+	.axis_source = wl_pointer_axis_source,
+	.axis_stop = wl_pointer_axis_stop,
+	.axis_discrete = wl_pointer_axis_discrete,
+	.frame = wl_pointer_frame,
+};
+
+static void
+wl_seat_capabilities(void *data, struct wl_seat *wl_seat, uint32_t capabilities)
+{
+	struct input_state *istate = data;
+	bool have_pointer = capabilities & WL_SEAT_CAPABILITY_POINTER;
+
+	if (have_pointer && wl_pointer == NULL) {
+		wl_pointer = wl_seat_get_pointer(wl_seat);
+		wl_pointer_add_listener(wl_pointer,
+				&wl_pointer_listener, istate);
+	} else if (!have_pointer && wl_pointer != NULL) {
+		wl_pointer_release(wl_pointer);
+		wl_pointer = NULL;
+	}
+}
+
+static void
+wl_seat_name(void *data, struct wl_seat *wl_seat, const char *name)
+{
+	fprintf(stderr, "seat name: %s\n", name);
+}
+
+static const struct wl_seat_listener wl_seat_listener = {
+	.capabilities = wl_seat_capabilities,
+	.name = wl_seat_name,
+};
+
 static void
 handle_global(void *data, struct wl_registry *registry,
 		uint32_t name, const char *interface, uint32_t version)
 {
+	struct input_state *istate = data;
 	if (strcmp(interface, wl_compositor_interface.name) == 0) {
 		compositor = wl_registry_bind(registry, name,
 				&wl_compositor_interface, 4);
@@ -441,10 +648,20 @@ handle_global(void *data, struct wl_registry *registry,
 	} else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
 		layer_shell = wl_registry_bind(registry, name,
 				&zwlr_layer_shell_v1_interface, 1);
+	} else if (strcmp(interface, wl_seat_interface.name) == 0) {
+		wl_seat = wl_registry_bind(registry, name, &wl_seat_interface, 5);
+		wl_seat_add_listener(wl_seat, &wl_seat_listener, istate);
 	}
 }
 
-static const struct wl_registry_listener registry_listener = {.global = handle_global,};
+static void
+handle_global_remove(void *data, struct wl_registry *wl_registry, uint32_t name)
+{}
+
+static const struct wl_registry_listener registry_listener = {
+	.global = handle_global,
+	.global_remove = handle_global_remove,
+};
 
 static void
 read_stdin(void)
@@ -666,7 +883,8 @@ main(int argc, char **argv)
 		BARF("Failed to create display");
 
 	struct wl_registry *registry = wl_display_get_registry(display);
-	wl_registry_add_listener(registry, &registry_listener, NULL);
+	struct input_state istate = {0};
+	wl_registry_add_listener(registry, &registry_listener, &istate);
 	wl_display_roundtrip(display);
 
 	if (!compositor || !shm || !layer_shell)
