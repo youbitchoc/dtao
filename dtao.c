@@ -93,6 +93,8 @@ struct clickable {
 
 static int clickies = 0;
 static struct clickable clickables[MAX_CLICKABLES];
+static int clickstack[MAX_CLICKABLES];
+static int clickstacktop;
 
 static void
 wl_buffer_release(void *data, struct wl_buffer *wl_buffer)
@@ -275,11 +277,19 @@ handle_cmd(char *cmd, pixman_color_t *bg, pixman_color_t *fg, uint32_t *xpos, ui
 		*xpos = savedx;
 	} else if (!strcmp(cmd, "ca")) {
 		if (!*arg) {
-			clickables[clickies].x2 = *xpos;
-			clickables[clickies].y2 = height;
-			clickies++;
-		} else if (parse_clickable(arg, &clickables[clickies], *xpos, *ypos)) {
-			fprintf(stderr, "Bad click area \"%s\"\n", arg);
+			if (clickstacktop < 1)
+				BARF("Bad click areas");
+			clickstacktop--;
+			clickables[clickstack[clickstacktop]].x2 = *xpos;
+			clickables[clickstack[clickstacktop]].y2 = height;
+		} else {
+			clickstack[clickstacktop] = clickies++;
+			if (parse_clickable(arg,
+					    &clickables[clickstack[clickstacktop]],
+					    *xpos, *ypos))
+				fprintf(stderr, "Bad click area \"%s\"\n", arg);
+			else
+				clickstacktop++;
 		}
 	} else {
 		fprintf(stderr, "Unrecognized command \"%s\"\n", cmd);
@@ -340,6 +350,8 @@ draw_frame(char *text)
 	uint32_t ypos = (height + font->ascent - font->descent) / 2;
 
 	uint32_t codepoint, lastcp = 0, state = UTF8_ACCEPT;
+
+	clickstacktop = 0;
 	for (char *p = text; *p; p++) {
 		/* Check for inline ^ commands */
 		if (state == UTF8_ACCEPT && *p == '^') {
