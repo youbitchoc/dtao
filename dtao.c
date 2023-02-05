@@ -542,7 +542,10 @@ wl_pointer_leave(void *data, struct wl_pointer *wl_pointer,
 static void
 wl_pointer_axis(void *data, struct wl_pointer *wl_pointer, uint32_t time,
 		uint32_t axis, wl_fixed_t value)
-{}
+{
+	struct input_state *istate = data;
+	istate->button = value = 0 ? 0 : value > 0 ? 275 : 276;
+}
 
 static void
 wl_pointer_axis_source(void *data, struct wl_pointer *wl_pointer,
@@ -552,7 +555,10 @@ wl_pointer_axis_source(void *data, struct wl_pointer *wl_pointer,
 static void
 wl_pointer_axis_stop(void *data, struct wl_pointer *wl_pointer,
 		uint32_t time, uint32_t axis)
-{}
+{
+	struct input_state *istate = data;
+	istate->button = 0;
+}
 
 static void
 wl_pointer_axis_discrete(void *data, struct wl_pointer *wl_pointer,
