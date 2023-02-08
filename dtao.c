@@ -96,6 +96,9 @@ static struct clickable clickables[MAX_CLICKABLES];
 static int clickstack[MAX_CLICKABLES];
 static int clickstacktop;
 
+static int64_t cur_axis = -1;
+static wl_fixed_t cur_scroll = 0;
+
 static void
 wl_buffer_release(void *data, struct wl_buffer *wl_buffer)
 {
@@ -544,26 +547,38 @@ wl_pointer_axis(void *data, struct wl_pointer *wl_pointer, uint32_t time,
 		uint32_t axis, wl_fixed_t value)
 {
 	struct input_state *istate = data;
-	istate->button = value = 0 ? 0 : value > 0 ? 275 : 276;
+	if (cur_axis < 0 ||
+			abs(value) > 2*abs(cur_scroll)) { /* switch to stronger scroll */
+		cur_axis = axis;
+		cur_scroll = value;
+	}
+	if (axis == cur_axis)
+		istate->button = value = 0 ? 0 : value > 0 ? 275 : 276;
 }
 
 static void
 wl_pointer_axis_source(void *data, struct wl_pointer *wl_pointer,
 		uint32_t axis_source)
-{}
+{
+}
 
 static void
 wl_pointer_axis_stop(void *data, struct wl_pointer *wl_pointer,
 		uint32_t time, uint32_t axis)
 {
 	struct input_state *istate = data;
-	istate->button = 0;
+	if (axis == cur_axis) {
+		istate->button = 0;
+		cur_axis = -1;
+		cur_scroll = 0;
+	}
 }
 
 static void
 wl_pointer_axis_discrete(void *data, struct wl_pointer *wl_pointer,
 			uint32_t axis, int32_t discrete)
-{}
+{
+}
 
 void
 spawn(const char *arg)
@@ -674,7 +689,8 @@ handle_global(void *data, struct wl_registry *registry,
 
 static void
 handle_global_remove(void *data, struct wl_registry *wl_registry, uint32_t name)
-{}
+{
+}
 
 static const struct wl_registry_listener registry_listener = {
 	.global = handle_global,
