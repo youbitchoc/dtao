@@ -52,6 +52,7 @@ static struct wl_seat *wl_seat;
 static struct wl_pointer *wl_pointer;
 
 static int32_t output = -1;
+static char *output_name = NULL;
 
 static uint32_t width, height, titlewidth;
 static uint32_t stride, bufsize;
@@ -664,6 +665,54 @@ static const struct wl_seat_listener wl_seat_listener = {
 };
 
 static void
+wl_output_geometry(void *data, struct wl_output *wl_output,
+                int32_t x, int32_t y, int32_t w, int32_t h,
+                int32_t subpixel, const char *make, const char *model,
+                int32_t transform)
+{
+}
+
+static void
+wl_output_mode(void *data, struct wl_output *wl_output,
+                uint32_t flags, int32_t width, int32_t height, int32_t refresh)
+{
+}
+
+static void
+wl_output_done(void *data, struct wl_output *wl_output)
+{
+}
+
+static void
+wl_output_scale(void *data, struct wl_output *wl_output,
+                int32_t factor)
+{
+}
+
+static void
+wl_output_description(void *data, struct wl_output *output,
+		const char *description)
+{
+}
+
+static void
+wl_output_name(void *data, struct wl_output *output, const char *name)
+{
+	if (!output_name) return;
+	if (!strcmp(output_name, name))
+		wl_output = output;
+}
+
+static const struct wl_output_listener output_listener = {
+	.geometry = wl_output_geometry,
+	.mode = wl_output_mode,
+	.done = wl_output_done,
+	.scale = wl_output_scale,
+	.name = wl_output_name,
+	.description = wl_output_description,
+};
+
+static void
 handle_global(void *data, struct wl_registry *registry,
 		uint32_t name, const char *interface, uint32_t version)
 {
@@ -674,10 +723,18 @@ handle_global(void *data, struct wl_registry *registry,
 	} else if (strcmp(interface, wl_shm_interface.name) == 0) {
 		shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
 	} else if (strcmp(interface, wl_output_interface.name) == 0) {
-		struct wl_output *o = wl_registry_bind(registry, name,
-				&wl_output_interface, 1);
-		if (output-- == 0)
-			wl_output = o;
+		if (output_name) {
+			if (version < 4)
+				EBARF("wl_output_name not supported by compositor");
+			wl_output_add_listener(wl_registry_bind(
+					registry, name, &wl_output_interface, 4),
+					&output_listener, NULL);
+		} else {
+			struct wl_output *o = wl_registry_bind(registry, name,
+					&wl_output_interface, 1);
+			if (output-- == 0)
+				wl_output = o;
+		}
 	} else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
 		layer_shell = wl_registry_bind(registry, name,
 				&zwlr_layer_shell_v1_interface, 1);
@@ -881,10 +938,16 @@ main(int argc, char **argv)
 				BARF("option -w requires an argument");
 			width = atoi(argv[i]);
 		} else if (!strcmp(argv[i], "-xs")) {
+			int j;
 			if (++i >= argc)
 				BARF("option -xs requires an argument");
-			/* One-based to match dzen2 */
-			output = atoi(argv[i]) - 1;
+			output = 0;
+			for (j = 0; argv[i][j] && isdigit(argv[i][j]); j++)
+				output = output * 10 + argv[i][j] - '0';
+			if (argv[i][j])
+				output_name = argv[i];
+			else if (output > 0)
+				output--; /* One-based to match dzen2 */
 		} else if (!strcmp(argv[i], "-x")) {
 			if (++i >= argc)
 				BARF("option -x requires an argument");
@@ -919,6 +982,7 @@ main(int argc, char **argv)
 	struct wl_registry *registry = wl_display_get_registry(display);
 	struct input_state istate = {0};
 	wl_registry_add_listener(registry, &registry_listener, &istate);
+	wl_display_dispatch(display);
 	wl_display_roundtrip(display);
 
 	if (!compositor || !shm || !layer_shell)
@@ -935,6 +999,14 @@ main(int argc, char **argv)
 	wl_surface = wl_compositor_create_surface(compositor);
 	if (!wl_surface)
 		BARF("could not create wl_surface");
+
+	if (!wl_output && output >= 0) {
+		if (output_name)
+			BARF("could not bind to wl_output %s",
+				output_name);
+		else
+			BARF("could not bind to wl_output");
+	}
 
 	layer_surface = zwlr_layer_shell_v1_get_layer_surface(layer_shell,
 			wl_surface, wl_output, layer, namespace);
