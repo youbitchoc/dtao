@@ -36,6 +36,7 @@
 /* Includes the newline character */
 #define MAX_LINE_LEN 8192
 #define MAX_CLICKABLES 64
+#define SCROLL_THRESHOLD 400
 
 enum align { ALIGN_C, ALIGN_L, ALIGN_R };
 
@@ -99,6 +100,7 @@ static int clickstacktop;
 
 static int64_t cur_axis = -1;
 static wl_fixed_t cur_scroll = 0;
+static wl_fixed_t cur_scrollcarry = 0;
 
 static void
 wl_buffer_release(void *data, struct wl_buffer *wl_buffer)
@@ -548,13 +550,19 @@ wl_pointer_axis(void *data, struct wl_pointer *wl_pointer, uint32_t time,
 		uint32_t axis, wl_fixed_t value)
 {
 	struct input_state *istate = data;
-	if (cur_axis < 0 ||
-			abs(value) > 2*abs(cur_scroll)) { /* switch to stronger scroll */
+	if (axis != cur_axis) {
+		if (abs(value) < 4*cur_scroll)
+			return;
 		cur_axis = axis;
-		cur_scroll = value;
+		cur_scrollcarry = 0;
+	} else if ((value > 0) == (cur_scroll < 0))
+		cur_scrollcarry = 0;
+	cur_scroll = abs(value);
+	cur_scrollcarry += cur_scroll;
+	if (cur_scrollcarry > SCROLL_THRESHOLD) {
+		cur_scrollcarry = MIN(SCROLL_THRESHOLD, cur_scrollcarry - SCROLL_THRESHOLD);
+		istate->button = value > 0 ? 275 : 276;
 	}
-	if (axis == cur_axis)
-		istate->button = value = 0 ? 0 : value > 0 ? 275 : 276;
 }
 
 static void
@@ -617,7 +625,11 @@ wl_pointer_frame(void *data, struct wl_pointer *wl_pointer)
 				istate->x <= clickables[i].x2 &&
 				istate->y >= clickables[i].y1 &&
 				istate->y <= clickables[i].y2) {
-			spawn(clickables[i].cmd);
+//			do {
+				spawn(clickables[i].cmd);
+//			} while (istate->button >= 275 &&
+//				 istate->button <= 276 &&
+//				 --cur_scrollcarry > 0);
 			break;
 		}
 	}
