@@ -15,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <wayland-client.h>
+#include <wayland-cursor.h>
 #include "utf8.h"
 #include "wlr-layer-shell-unstable-v1-protocol.h"
 #include "xdg-shell-protocol.h"
@@ -51,6 +52,9 @@ static struct wl_surface *wl_surface;
 
 static struct wl_seat *wl_seat;
 static struct wl_pointer *wl_pointer;
+
+static struct wl_surface *cursor_surface;
+static struct wl_cursor_image *cursor_image;
 
 static int32_t output = -1;
 static char *output_name = NULL;
@@ -518,6 +522,8 @@ wl_pointer_enter(void *data, struct wl_pointer *wl_pointer,
 	istate->surface = surface;
 	istate->x = wl_fixed_to_double(surface_x);
 	istate->y = wl_fixed_to_double(surface_y);
+	wl_pointer_set_cursor(wl_pointer, serial, cursor_surface,
+		cursor_image->hotspot_x, cursor_image->hotspot_y);
 }
 
 static void
@@ -1000,6 +1006,16 @@ main(int argc, char **argv)
 	if (!compositor || !shm || !layer_shell)
 		BARF("compositor does not support all needed protocols");
 
+	/* Set cursor */
+	struct wl_cursor_theme *cursor_theme = wl_cursor_theme_load(NULL, 24, shm);
+	struct wl_cursor *cursor = wl_cursor_theme_get_cursor(cursor_theme, "left_ptr");
+	cursor_image = cursor->images[0];
+	struct wl_buffer *cursor_buffer = wl_cursor_image_get_buffer(cursor_image);
+
+	cursor_surface = wl_compositor_create_surface(compositor);
+	wl_surface_attach(cursor_surface, cursor_buffer, 0, 0);
+	wl_surface_commit(cursor_surface);
+	
 	/* Load selected font */
 	fcft_init(FCFT_LOG_COLORIZE_AUTO, 0, FCFT_LOG_CLASS_ERROR);
 	fcft_set_scaling_filter(FCFT_SCALING_FILTER_LANCZOS3);
