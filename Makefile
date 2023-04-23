@@ -45,7 +45,7 @@ dtao.o: utf8.h xdg-shell-protocol.h wlr-layer-shell-unstable-v1-protocol.h
 dtao: xdg-shell-protocol.o wlr-layer-shell-unstable-v1-protocol.o
 
 # Library dependencies
-dtao: CFLAGS+=$(shell pkg-config --cflags wayland-client fcft pixman-1)
-dtao: LDLIBS+=$(shell pkg-config --libs wayland-client fcft pixman-1) -lrt
+dtao: CFLAGS+=$(shell pkg-config --cflags wayland-client wayland-cursor fcft pixman-1)
+dtao: LDLIBS+=$(shell pkg-config --libs wayland-client wayland-cursor fcft pixman-1) -lrt
 
 .PHONY: all clean install
